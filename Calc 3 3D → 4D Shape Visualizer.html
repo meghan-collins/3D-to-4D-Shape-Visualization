@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3D → 4D Shape Visualizer</title>
+<style>
+:root{--bg:#f6f7fb;--fg:#1c2030;--panel:#ffffff;--line:#d5d9e6;--accent:#4a5bd8;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d0f18;--fg:#e6e8f2;--panel:#161a28;--line:#2a3047;--accent:#8ea0ff}}
+:root[data-theme="dark"]{--bg:#0d0f18;--fg:#e6e8f2;--panel:#161a28;--line:#2a3047;--accent:#8ea0ff}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+#app{display:grid;grid-template-columns:1fr 310px;height:100%}
+#stage{position:relative;min-height:0}
+canvas{width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+#hint{position:absolute;left:12px;bottom:10px;font-size:12px;opacity:.65;pointer-events:none}
+#panel{background:var(--panel);border-left:1px solid var(--line);padding:14px;overflow-y:auto}
+h1{font-size:16px;margin:0 0 10px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;opacity:.6;margin:16px 0 6px}
+label{display:flex;justify-content:space-between;margin-top:8px;font-size:13px}
+label output{opacity:.7;font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:var(--accent)}
+select,button{width:100%;padding:7px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+button{cursor:pointer;margin-top:6px}
+.row{display:flex;gap:8px}
+.chk{display:flex;align-items:center;gap:8px;margin-top:8px}
+p.note{font-size:12px;opacity:.7;margin:8px 0 0}
+@media (max-width:760px){#app{grid-template-columns:1fr;grid-template-rows:55% 45%}#panel{border-left:0;border-top:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div id="app">
+ <div id="stage"><canvas id="c"></canvas><div id="hint">Drag: orbit view · Shift+drag (or two-finger): rotate in 4D (XW/YW) · Wheel: zoom</div></div>
+ <div id="panel">
+  <h1>3D → 4D Shape Visualizer</h1>
+  <select id="shape">
+   <option value="tess">Tesseract (hypercube)</option>
+   <option value="hs">Hypersphere (3-sphere)</option>
+   <option value="hd">Hyper donut (ring of spheres)</option>
+  </select>
+  <select id="mode" style="margin-top:8px">
+   <option value="proj">Projection: 4D shadow in 3D</option>
+   <option value="slice">Slice: 3D cross-section at w</option>
+  </select>
+  <p class="note" id="desc"></p>
+
+  <h2>4D rotation (degrees)</h2>
+  <div id="rots"></div>
+  <div class="chk"><input type="checkbox" id="spin" checked><label style="margin:0;display:inline">Auto-spin in 4D (XW, YW, ZW)</label></div>
+
+  <h2>Size &amp; shape</h2>
+  <div id="sizes"></div>
+  <button id="reset">Reset</button>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const cv=$('c'),ctx=cv.getContext('2d');
+const mq=window.matchMedia('(prefers-color-scheme: dark)');
+const isDark=()=>{const t=document.documentElement.dataset.theme;return t?t==='dark':mq.matches};
+
+// UI
+const rotDefs=[['XY',0,1],['XZ',0,2],['YZ',1,2],['XW',0,3],['YW',1,3],['ZW',2,3]];
+const P={XY:0,XZ:0,YZ:0,XW:25,YW:0,ZW:0,size:1,dist:3,stretchW:1,tube:.45,slice:0};
+function addSlider(parent,key,label,min,max,step){
+  const l=document.createElement('label');l.innerHTML=`<span>${label}</span><output></output>`;
+  const s=document.createElement('input');s.type='range';s.min=min;s.max=max;s.step=step;s.value=P[key];s.id='s_'+key;
+  const o=l.querySelector('output');
+  const upd=()=>{P[key]=+s.value;o.textContent=(+s.value).toFixed(step<1?2:0)};
+  s.oninput=upd;upd();parent.append(l,s);
+}
+rotDefs.forEach(([n])=>addSlider($('rots'),n,n+' plane',0,360,1));
+addSlider($('sizes'),'size','Overall size',.3,2.5,.01);
+addSlider($('sizes'),'stretchW','Stretch along W',.2,2,.01);
+addSlider($('sizes'),'dist','4D camera distance',1.6,8,.01);
+addSlider($('sizes'),'tube','Donut tube thickness',.15,.9,.01);
+addSlider($('sizes'),'slice','Slice position (w)',-1.5,1.5,.01);
+const setSlider=(k,v)=>{const s=$('s_'+k);s.value=v;s.dispatchEvent(new Event('input'))};
+
+const DESC={
+ tess:'A cube is two squares joined edge-to-edge; a tesseract is two cubes joined vertex-to-vertex through the 4th dimension. In projection you see a cube inside a cube; rotate XW/YW/ZW to watch them swap.',
+ hs:'A sphere is all points at distance r from a center in 3D; a hypersphere does the same in 4D. Its cross-section is a 3D sphere that grows from a point to full size and shrinks back as you move the slice through w.',
+ hd:'A donut is a circle swept around a circle. Here the tube’s cross-section is a full sphere instead of a disc, so the shape lives in 4D. Slices of it look like donuts, spheres, or linked pieces.'
+};
+
+//shapes: lists of 4D polylines
+const TAU=Math.PI*2;
+function curve(n,f,closed){const a=[];for(let i=0;i<=n;i++)a.push(f(i/n));return a}
+function build(kind,tube){
+  const L=[];
+  if(kind==='tess'){
+    for(let m=0;m<16;m++){
+      const v=[0,1,2,3].map(b=>(m>>b&1)?1:-1);
+      for(let b=0;b<4;b++) if(!(m>>b&1)){const u=v.slice();u[b]=1;const w=v.slice();w[b]=-1;L.push([w,u]);}
+    }
+    // densify so slices and perspective look smooth
+    return L.map(e=>curve(12,t=>e[0].map((x,i)=>x+(e[1][i]-x)*t)));
+  }
+  if(kind==='hs'){
+    const ets=[.5,.95,1.35],K=6;
+    for(const e of ets)for(let k=0;k<K;k++){
+      const q=k/K*TAU;
+      L.push(curve(40,t=>{const x=t*TAU;return[Math.cos(e)*Math.cos(x),Math.cos(e)*Math.sin(x),Math.sin(e)*Math.cos(q),Math.sin(e)*Math.sin(q)]}));
+      L.push(curve(40,t=>{const x=t*TAU;return[Math.cos(e)*Math.cos(q),Math.cos(e)*Math.sin(q),Math.sin(e)*Math.cos(x),Math.sin(e)*Math.sin(x)]}));
+    }
+    for(let i=0;i<K;i++)for(let j=0;j<K;j++){
+      const a=i/K*TAU,b=j/K*TAU;
+      L.push(curve(24,t=>{const e=t*Math.PI/2;return[Math.cos(e)*Math.cos(a),Math.cos(e)*Math.sin(a),Math.sin(e)*Math.cos(b),Math.sin(e)*Math.sin(b)]}));
+    }
+    return L;
+  }
+  // hyper donut: ((R+r cos c)cos a, (R+r cos c) sin a, r sin c cos b, r sin c sin b)
+  const R=1,r=tube,pt=(a,c,b)=>[(R+r*Math.cos(c))*Math.cos(a),(R+r*Math.cos(c))*Math.sin(a),r*Math.sin(c)*Math.cos(b),r*Math.sin(c)*Math.sin(b)];
+  for(let ci=1;ci<=5;ci++)for(let bi=0;bi<8;bi++){const c=ci/6*Math.PI,b=bi/8*TAU;L.push(curve(60,t=>pt(t*TAU,c,b)))}
+  for(let ai=0;ai<18;ai++)for(let ci=1;ci<=5;ci++){const a=ai/18*TAU,c=ci/6*Math.PI;L.push(curve(24,t=>pt(a,c,t*TAU)))}
+  for(let ai=0;ai<18;ai++)for(let bi=0;bi<8;bi++){const a=ai/18*TAU,b=bi/8*TAU;L.push(curve(20,t=>pt(a,t*Math.PI,b)))}
+  return L;
+}
+let shape=null,shapeKey='',shapeTube=-1;
+function ensureShape(){
+  const k=$('shape').value;
+  if(k!==shapeKey||(k==='hd'&&P.tube!==shapeTube)){shape=build(k,P.tube);shapeKey=k;shapeTube=P.tube;$('desc').textContent=DESC[k]}
+}
+
+// view & interaction
+let yaw=.5,pitch=.35;
+let drag=null;
+cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};cv.setPointerCapture(e.pointerId);cv.style.cursor='grabbing'});
+cv.addEventListener('pointerup',()=>{drag=null;cv.style.cursor='grab'});
+cv.addEventListener('pointermove',e=>{
+  if(!drag)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;drag={x:e.clientX,y:e.clientY};
+  if(e.shiftKey){setSlider('XW',((P.XW+dx*.5)%360+360)%360);setSlider('YW',((P.YW+dy*.5)%360+360)%360)}
+  else{yaw+=dx*.008;pitch=Math.max(-1.5,Math.min(1.5,pitch+dy*.008))}
+});
+cv.addEventListener('wheel',e=>{e.preventDefault();setSlider('size',Math.max(.3,Math.min(2.5,P.size*(e.deltaY<0?1.06:.94))))},{passive:false});
+$('reset').onclick=()=>{Object.assign(P,{XY:0,XZ:0,YZ:0,XW:25,YW:0,ZW:0,size:1,dist:3,stretchW:1,tube:.45,slice:0});for(const k in P)if($('s_'+k))setSlider(k,P[k]);yaw=.5;pitch=.35};
+
+function resize(){const d=devicePixelRatio||1,r=cv.getBoundingClientRect();cv.width=r.width*d;cv.height=r.height*d;ctx.setTransform(d,0,0,d,0,0)}
+addEventListener('resize',resize);resize();
+
+// render
+function rot4(p,i,j,a){const c=Math.cos(a),s=Math.sin(a),x=p[i],y=p[j];p[i]=x*c-y*s;p[j]=x*s+y*c}
+const BUCKETS=18;
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(.05,(now-last)/1000);last=now;
+  if($('spin').checked){
+    setSlider('XW',(P.XW+dt*22)%360);setSlider('YW',(P.YW+dt*14)%360);setSlider('ZW',(P.ZW+dt*9)%360);
+  }
+  ensureShape();
+  const W=cv.clientWidth,H=cv.clientHeight,cx=W/2,cy=H/2,scale=Math.min(W,H)*.2*P.size;
+  ctx.clearRect(0,0,W,H);
+  const dark=isDark(),lum=dark?62:38,slice=$('mode').value==='slice';
+  const ang=rotDefs.map(([n])=>P[n]*Math.PI/180);
+  const cyw=Math.cos(yaw),syw=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),CAM=6;
+
+  const proj3=(p)=>{ // 3D point -> screen
+    let [x,y,z]=p;
+    let x1=x*cyw+z*syw,z1=-x*syw+z*cyw;
+    let y1=y*cp-z1*sp,z2=y*sp+z1*cp;
+    const k=CAM/(CAM-z2);
+    return[cx+x1*scale*k,cy-y1*scale*k,z2];
+  };
+  const buckets=Array.from({length:BUCKETS},()=>[]);
+  const dots=[];
+  const D=P.dist,sl=P.slice;
+  for(const pl of shape){
+    const pts=pl.map(q=>{
+      const p=[q[0],q[1],q[2],q[3]*P.stretchW];
+      for(let i=0;i<6;i++)rot4(p,rotDefs[i][1],rotDefs[i][2],ang[i]);
+      return p;
+    });
+    // projection (always computed, faint ghost in slice mode)
+    let prev=null,prevW=0;
+    for(const p of pts){
+      const k=D/Math.max(.05,D-p[3]);
+      const s=proj3([p[0]*k,p[1]*k,p[2]*k]);
+      if(prev){
+        const wv=(p[3]+prevW)/2,b=Math.max(0,Math.min(BUCKETS-1,Math.floor((wv/1.6+.5)*BUCKETS)));
+        buckets[b].push(prev[0],prev[1],s[0],s[1]);
+      }
+      prev=s;prevW=p[3];
+    }
+    if(slice){
+      for(let i=1;i<pts.length;i++){
+        const a=pts[i-1],b=pts[i],da=a[3]-sl,db=b[3]-sl;
+        if(da*db<0){const t=da/(da-db);dots.push(proj3([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t]))}
+      }
+    }
+  }
+  ctx.lineCap='round';
+  ctx.lineWidth=slice?1:1.4;
+  ctx.globalAlpha=slice?.14:.85;
+  for(let b=0;b<BUCKETS;b++){
+    const seg=buckets[b];if(!seg.length)continue;
+    ctx.strokeStyle=`hsl(${210+b/BUCKETS*150} 85% ${lum}%)`;
+    ctx.beginPath();
+    for(let i=0;i<seg.length;i+=4){ctx.moveTo(seg[i],seg[i+1]);ctx.lineTo(seg[i+2],seg[i+3])}
+    ctx.stroke();
+  }
+  if(slice){
+    ctx.globalAlpha=.95;ctx.fillStyle=dark?'#ffd166':'#c2410c';
+    for(const d of dots){ctx.beginPath();ctx.arc(d[0],d[1],2.1,0,TAU);ctx.fill()}
+  }
+  ctx.globalAlpha=.7;ctx.fillStyle=dark?'#e6e8f2':'#1c2030';ctx.font='12px system-ui,sans-serif';
+  ctx.fillText(slice?`Cross-section at w = ${sl.toFixed(2)} (${dots.length} sample points)`:'Colour = w depth (blue: far in −w, pink: toward +w)',12,18);
+  ctx.globalAlpha=1;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
